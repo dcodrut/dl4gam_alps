@@ -1,3 +1,4 @@
+
 from pathlib import Path
 from typing import Union
 
@@ -12,38 +13,31 @@ from utils.sampling_utils import get_patches_gdf
 
 
 def extract_inputs(ds, fp, input_settings):
-    band_names = ds.band_data.attrs['long_name']
-    idx_bands = [band_names.index(b) for b in input_settings['s2_bands']]
-    s2_bands = ds.band_data.isel(band=idx_bands).values.astype(np.float32)
+    s1_bands = ds.band_data.values.astype(np.float32)
 
-    # extract the provided nodata mask
-    mask_no_data = ds.band_data.values[band_names.index('FILL_MASK')] == 0
-
-    # include to the nodata mask any NaN pixel
-    # (it happened once that a few pixels were missing only from the last band but the mask did not include them)
-    mask_na_per_band = np.isnan(s2_bands)
+    # fill-in the data gaps with the average and build a mask which will be used for the loss
+    mask_no_data = np.zeros_like(s1_bands[0]).astype(bool)
+    mask_na_per_band = np.isnan(s1_bands)
     if mask_na_per_band.sum() > 0:
         idx_na = np.where(mask_na_per_band)
 
         # fill in the gaps with the average
-        avg_per_band = np.nansum(np.nansum(s2_bands, axis=-1), axis=-1) / np.prod(s2_bands.shape[-2:])
-        s2_bands[idx_na[0], idx_na[1], idx_na[2]] = avg_per_band[idx_na[0]]
+        avg_per_band = np.nansum(np.nansum(s1_bands, axis=-1), axis=-1) / np.prod(s1_bands.shape[-2:])
+        s1_bands[idx_na[0], idx_na[1], idx_na[2]] = avg_per_band[idx_na[0]]
 
         # make sure that these pixels are masked in mask_no_data too
         mask_na = mask_na_per_band.any(axis=0)
         mask_no_data |= mask_na
 
-    # include in the nodata mask the pixels covered by clouds or shadows
-    mask_clouds = ds.band_data.values[band_names.index('CLOUD_MASK')] == 1
-    mask_shadow = ds.band_data.values[band_names.index('SHADOW_MASK')] == 1
-    mask_no_data |= (mask_clouds | mask_shadow)
+    # add the glacier mask to the no-data mask s.t. the loss ignores the non-glacierized area
+    mask_non_glacier = ~(ds.mask_data_ok.values == 1)
+    mask_no_data |= mask_non_glacier
 
     data = {
-        's2_bands': s2_bands,
+        's1_bands': s1_bands,
         'mask_no_data': mask_no_data,
-        'mask_crt_g': ds.mask_crt_g.values == 1,
-        'mask_all_g': ds.mask_all_g_id.values != -1,
-        'mask_debris_crt_g': ds.mask_debris_crt_g.values == 1,
+        'mask_crt': ds.mask_crt.values == 1,
+        'mask_all': ds.mask_all.values == 1,
         'fp': str(fp),
     }
 
@@ -160,10 +154,11 @@ class GlSegDataset(GlSegPatchDataset):
         self.fp = fp
         super().__init__(folder=None, fp_list=[fp], **kwargs)
 
-        # get all possible patches for the glacier
+        # get all possible patches for the current entry
         self.nc = xr.open_dataset(fp, decode_coords='all').load()
-        self.patches_df = get_patches_gdf(
-            self.nc, patch_radius=128, sampling_step=64, add_center=False, add_centroid=True, add_extremes=True)
+        self.nc['mask_crt'] = self.nc['mask_all']
+        sampling_mask = np.ones_like(self.nc.mask_all).astype(bool)
+        self.patches_df = get_patches_gdf(self.nc, patch_radius=64, sampling_step=32, sampling_mask=sampling_mask)
 
     def __getitem__(self, idx):
         patch_shp = self.patches_df.iloc[idx:idx + 1]
@@ -171,7 +166,7 @@ class GlSegDataset(GlSegPatchDataset):
 
         data = self.process_data(ds=nc_patch, fp=self.fp)
 
-        # add information regarding the location of the patch w.r.t. the entire glacier
+        # add information regarding the location of the patch w.r.t. the entire entry
         data['patch_info'] = {k: patch_shp.iloc[0][k] for k in ['x_center', 'y_center', 'bounds_px']}
 
         return data
@@ -257,20 +252,20 @@ class GlSegDataModule(pl.LightningDataModule):
                 data_stats_df=self.data_stats_df
             )
 
-    def setup_dl_per_glacier(self, gid_list=None):
-        # get the directory of the full glacier cubes
+    def setup_dl_per_image(self, gid_list=None):
+        # get the directory of the full images
         cubes_dir = Path(self.rasters_dir)
         assert cubes_dir.exists()
 
-        # get all glaciers
+        # get all entries
         cubes_fp = sorted(list(cubes_dir.glob('**/*.nc')))
 
-        # filter the glaciers by id, if needed
+        # filter the entries by id, if needed
         if gid_list is not None:
-            cubes_fp = list(filter(lambda f: f.parent.name in gid_list, cubes_fp))
+            cubes_fp = list(filter(lambda f: f.name in gid_list, cubes_fp))
 
         test_ds_list = []
-        for fp in tqdm(cubes_fp, desc='Preparing datasets per glacier'):
+        for fp in tqdm(cubes_fp, desc='Preparing datasets per entry'):
             test_ds_list.append(
                 GlSegDataset(
                     fp=fp,
@@ -314,8 +309,8 @@ class GlSegDataModule(pl.LightningDataModule):
             drop_last=False
         )
 
-    def test_dataloaders_per_glacier(self, gid_list):
-        test_ds_list = self.setup_dl_per_glacier(gid_list=gid_list)
+    def test_dataloaders_per_image(self, gid_list):
+        test_ds_list = self.setup_dl_per_image(gid_list=gid_list)
 
         dloaders = []
         for ds in test_ds_list:

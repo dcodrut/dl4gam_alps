@@ -46,9 +46,9 @@ def compute_stats(fp):
 
 
 if __name__ == '__main__':
-    data_dir_root = Path(C.S2.DIR_GL_PATCHES)
-    out_dir_root = Path(C.S2.DIR_AUX_DATA) / Path(C.S2.DIR_GL_PATCHES).name
-    for i_split in range(1, C.S2.NUM_CV_FOLDS + 1):
+    data_dir_root = Path(C.S1.DIR_GL_PATCHES)
+    out_dir_root = Path(C.S1.DIR_AUX_DATA) / Path(C.S1.DIR_GL_PATCHES).name
+    for i_split in range(1, C.S1.NUM_CV_FOLDS + 1):
         data_dir_crt_split = data_dir_root / f'split_{i_split}' / 'fold_train'
         fp_list = sorted(list(Path(data_dir_crt_split).glob('**/*.nc')))
 

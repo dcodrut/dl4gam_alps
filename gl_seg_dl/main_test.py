@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import geopandas as gpd
+import pandas as pd
 import pytorch_lightning as pl
 import yaml
 from tqdm import tqdm
@@ -15,14 +16,15 @@ from task.data import GlSegDataModule
 from task.seg import GlSegTask
 from utils.general import str2bool
 
+# Logger (console and TensorBoard)
+root_logger = logging.getLogger('pytorch_lightning')
+root_logger.setLevel(logging.INFO)
+fmt = '[%(levelname)s] - %(asctime)s - %(name)s: %(message)s (%(filename)s:%(funcName)s:%(lineno)d)'
+root_logger.handlers[0].setFormatter(logging.Formatter(fmt))
+logger = logging.getLogger('pytorch_lightning.core')
 
-def test_model(settings, fold, test_per_glacier=False, checkpoint=None, dir_outlines_split=None):
-    # Logger (console and TensorBoard)
-    root_logger = logging.getLogger('pytorch_lightning')
-    root_logger.setLevel(logging.INFO)
-    fmt = '[%(levelname)s] - %(asctime)s - %(name)s: %(message)s (%(filename)s:%(funcName)s:%(lineno)d)'
-    root_logger.handlers[0].setFormatter(logging.Formatter(fmt))
-    logger = logging.getLogger('pytorch_lightning.core')
+
+def test_model(settings, fold, test_per_entry=False, glacier_id_list=None, checkpoint=None):
     logger.info(f'Settings: {settings}')
 
     # Data
@@ -42,11 +44,13 @@ def test_model(settings, fold, test_per_glacier=False, checkpoint=None, dir_outl
 
     # Task
     task_params = settings['task']
-    task = GlSegTask(model=model, task_params=task_params, outdir=Path(checkpoint).parent.parent)
+    task = GlSegTask(model=model, task_params=task_params)
     logger.info(f'Loading model from {checkpoint}')
+    device = f"cuda:{settings['trainer']['devices'][0]}" if settings['trainer']['accelerator'] == 'gpu' else 'cpu'
     if checkpoint is not None:  # allow using non-trainable models
         task.load_from_checkpoint(
             checkpoint_path=checkpoint,
+            map_location=device,
             model=model,
             task_params=task_params
         )
@@ -55,19 +59,22 @@ def test_model(settings, fold, test_per_glacier=False, checkpoint=None, dir_outl
     trainer_dict = settings['trainer']
     trainer = pl.Trainer(**trainer_dict)
 
-    logger.info(f'test_per_glacier = {test_per_glacier}')
-    if test_per_glacier:
-        ds_name = Path(data_params['rasters_dir']).name
-        root_outdir = Path(task.outdir) / 'output' / 'preds' / ds_name
+    logger.info(f'test_per_entry = {test_per_entry}')
+    checkpoint_root_dir = Path(checkpoint).parent.parent
+    if test_per_entry:
+        ds_name = Path(data_params['rasters_dir']).parent.name
+        subdir = Path(data_params['rasters_dir']).name
+        root_outdir = checkpoint_root_dir / 'output' / 'preds' / ds_name / subdir
     else:
-        ds_name = Path(data_params['data_root_dir']).name
-        root_outdir = Path(task.outdir) / 'output' / 'stats' / ds_name
+        ds_name = Path(data_params['data_root_dir']).parent.name
+        root_outdir = checkpoint_root_dir / 'output' / 'stats' / ds_name
 
     assert fold in ['s_train', 's_valid', 's_test']
     logger.info(f'Testing for fold = {fold}')
 
     task.outdir = root_outdir / fold
-    if not test_per_glacier:
+    logger.info(f"output directory = {task.outdir}")
+    if not test_per_entry:
         assert fold in ('s_train', 's_valid', 's_test')
         dm.setup('test' if fold == 's_test' else 'fit')
         if fold == 's_train':
@@ -80,24 +87,13 @@ def test_model(settings, fold, test_per_glacier=False, checkpoint=None, dir_outl
         results = trainer.validate(model=task, dataloaders=dl)
         logger.info(f'results = {results}')
     else:
-        fold = {'s_train': dm.train_dir_name, 's_valid': dm.val_dir_name, 's_test': dm.test_dir_name}[fold]
-        split_name = str(checkpoint).split('split_')[1].split('/')[0]
-        shp_fp = Path(dir_outlines_split) / f'split_{split_name}' / f'{fold}.shp'
-        logger.info(f'Reading the glaciers IDs of the split = {split_name} based on the shapefile from {shp_fp}')
-        gdf = gpd.read_file(shp_fp)
-        gl_num_list_crt_split = set(gdf.GLACIER_NR.astype(str))
-        logger.info(f'#glaciers in the current split = {len(gl_num_list_crt_split)}')
-
         dir_fp = Path(dm.rasters_dir)
-        logger.info(f'Reading the glaciers numbers based on the rasters from {dir_fp}')
+        logger.info(f'Reading the entries IDs based on the rasters from {dir_fp}')
         fp_list = list(dir_fp.glob('**/*.nc'))
-        gl_num_list_crt_dir = set([p.parent.name for p in fp_list])
-        logger.info(f'#glaciers in the current rasters dir = {len(gl_num_list_crt_dir)}')
+        glacier_id_list_crt_dir = set([p.name for p in fp_list])
+        logger.info(f'#entries in the current rasters dir = {len(glacier_id_list_crt_dir)}')
 
-        gl_num_list_crt_dir &= gl_num_list_crt_split
-        logger.info(f'After keeping only the glaciers from the current split: #glaciers = {len(gl_num_list_crt_dir)}')
-
-        dl_list = dm.test_dataloaders_per_glacier(gid_list=gl_num_list_crt_dir)
+        dl_list = dm.test_dataloaders_per_image(gid_list=glacier_id_list_crt_dir)
         for dl in tqdm(dl_list, desc='Testing per glacier'):
             trainer.test(model=task, dataloaders=dl)
 
@@ -127,13 +123,16 @@ if __name__ == "__main__":
                              '(alternative to checkpoint_file)', default=None)
     parser.add_argument('--fold', type=str, metavar='s_train|s_valid|s_test', required=True,
                         help='which subset to test on: either s_train, s_valid or s_test')
-    parser.add_argument('--test_per_glacier', type=str2bool, required=True,
+    parser.add_argument('--test_per_entry', type=str2bool, required=True,
                         help='whether to apply the model separately for each glacier instead of using the patches'
                              '(by generating in-memory all the patches)')
     parser.add_argument('--rasters_dir', type=str, required=False,
-                        help='directory on which to test the model, for the case when test_per_glacier is True; '
+                        help='directory on which to test the model, for the case when test_per_entry is True; '
                              'if not provided, the one from the config file is used'
                         )
+    parser.add_argument('--split_fp', type=str, required=False,
+                        help='path to a (geo)pandas dataframe containing the list of entries to be tested '
+                             'and the corresponding fold of each split. Either .csv or .shp.')
     parser.add_argument('--gpu_id', type=int, default=None, required=False
                         , help='GPU ID (if not given, the one from the config is used)'
                         )
@@ -144,7 +143,7 @@ if __name__ == "__main__":
         # get the best checkpoint
         checkpoint_file = get_best_model_ckpt(
             checkpoint_dir=args.checkpoint_dir,
-            metric_name='BinaryJaccardIndex_val_epoch_avg_per_g',
+            metric_name='BinaryJaccardIndex_val_epoch_avg_per_e',
             sort_method='max'
         )
     else:
@@ -168,14 +167,32 @@ if __name__ == "__main__":
     if args.rasters_dir is not None:
         infer_dir_list = [args.rasters_dir]
     else:
-        infer_dir_list = C.S2.DIRS_INFER
+        infer_dir_list = C.S1.DIRS_INFER
+
+    # choose the entries for the specified fold using the given shapefile
+    entry_ids = None
+    if args.test_per_entry:
+        assert args.split_fp is not None
+        fp = Path(args.split_fp)
+        assert fp.suffix in ('.csv', '.shp')
+        logger.info(f"Reading the split dataframe from {fp}")
+        split_df = gpd.read_file(fp, dtype={'entry_id': str})
+
+        # get the split on which the current model was trained on
+        split_name = f"split_{str(checkpoint_file).split('split_')[1].split('/')[0]}"
+
+        # get the list of entries for the specified fold
+        fold_name = f"fold_{args.fold[2:]}"
+        entry_ids = sorted(list(split_df[split_df[split_name] == fold_name].entry_id))
+        logger.info(f"split = {split_name}; fold = {fold_name}; #entries = {len(entry_ids)}")
 
     for infer_dir in infer_dir_list:
+        assert Path(infer_dir).exists(), f"{infer_dir} does not exist"
         all_settings['data']['rasters_dir'] = infer_dir
         test_model(
             settings=all_settings,
             checkpoint=checkpoint_file,
-            test_per_glacier=args.test_per_glacier,
+            test_per_entry=args.test_per_entry,
+            glacier_id_list=entry_ids,
             fold=args.fold,
-            dir_outlines_split=C.S2.DIR_OUTLINES_SPLIT
         )

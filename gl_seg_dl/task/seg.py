@@ -72,7 +72,7 @@ class GlSegTask(pl.LightningModule):
         # extract the glacier name from the patch filepath
         all_fp = [fp for x in step_outputs for fp in x['filepaths']]
         df = pd.DataFrame({'fp': all_fp})
-        df['gid'] = df.fp.apply(lambda s: Path(s).parent.parent.name)
+        df['entry_id'] = df.fp.apply(lambda s: Path(s).parent.name)
 
         # add the metrics
         for m in step_outputs[0]['metrics']:
@@ -80,15 +80,15 @@ class GlSegTask(pl.LightningModule):
 
         # summarize the metrics per glacier
         avg_tb_logs = {}
-        stats_per_g = df.groupby('gid').mean(numeric_only=True)
-        for m in stats_per_g.columns:
-            avg_tb_logs[f'{m}_{split_name}_epoch_avg_per_g'] = stats_per_g[m].mean()
+        stats_per_event = df.groupby('entry_id').mean(numeric_only=True)
+        for m in stats_per_event.columns:
+            avg_tb_logs[f'{m}_{split_name}_epoch_avg_per_e'] = stats_per_event[m].mean()
 
         return avg_tb_logs, df
 
     def training_step(self, batch, batch_idx):
         y_pred = self(batch)
-        y_true = batch['mask_all_g'].type(y_pred.dtype).unsqueeze(dim=1)
+        y_true = batch['mask_all'].type(y_pred.dtype).unsqueeze(dim=1)
         mask = ~batch['mask_no_data'].unsqueeze(dim=1)
         loss = self.loss(preds=y_pred, targets=y_true, mask=mask, samplewise=True)
 
@@ -98,14 +98,6 @@ class GlSegTask(pl.LightningModule):
 
         # compute the evaluation metrics for each element in the batch
         val_metrics_samplewise = self.compute_masked_val_metrics(y_pred, y_true, mask)
-
-        # compute the recall of the debris-covered areas
-        y_true_debris = batch['mask_debris_crt_g'].type(y_pred.dtype).unsqueeze(dim=1)
-        y_true_debris *= y_true  # in case the debris mask contains areas outside the current outlines
-        area_debris_fraction = y_true_debris.flatten(start_dim=1).sum(dim=1) / y_true.flatten(start_dim=1).sum(dim=1)
-        recall_samplewise_debris = self.compute_masked_val_metrics(y_pred, y_true_debris, mask)['BinaryRecall']
-        recall_samplewise_debris[area_debris_fraction < 0.01] = torch.nan
-        val_metrics_samplewise['BinaryRecall_debris'] = recall_samplewise_debris
 
         res = {'loss': loss.mean(), 'metrics': val_metrics_samplewise, 'filepaths': batch['fp']}
 
@@ -129,20 +121,12 @@ class GlSegTask(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         y_pred = self(batch)
-        y_true = batch['mask_all_g'].type(y_pred.dtype).unsqueeze(dim=1)
+        y_true = batch['mask_all'].type(y_pred.dtype).unsqueeze(dim=1)
         mask = ~batch['mask_no_data'].unsqueeze(dim=1)
         loss_samplewise = self.loss(preds=y_pred, targets=y_true, mask=mask, samplewise=True)
 
         # compute the evaluation metrics for each element in the batch
         val_metrics_samplewise = self.compute_masked_val_metrics(y_pred, y_true, mask)
-
-        # compute the recall of the debris-covered areas (if the area is above 1%)
-        y_true_debris = batch['mask_debris_crt_g'].type(y_pred.dtype).unsqueeze(dim=1)
-        y_true_debris *= y_true  # in case the debris mask contains areas outside the current outlines
-        area_debris_fraction = y_true_debris.flatten(start_dim=1).sum(dim=1) / y_true.flatten(start_dim=1).sum(dim=1)
-        recall_samplewise_debris = self.compute_masked_val_metrics(y_pred, y_true_debris, mask)['BinaryRecall']
-        recall_samplewise_debris[area_debris_fraction < 0.01] = torch.nan
-        val_metrics_samplewise['BinaryRecall_debris'] = recall_samplewise_debris
 
         # add also the loss to the metrics
         val_metrics_samplewise.update({'loss': loss_samplewise})
@@ -161,8 +145,6 @@ class GlSegTask(pl.LightningModule):
         # show the stats
         with pd.option_context('display.max_rows', 10, 'display.max_columns', None, 'display.width', None):
             self._logger.info(f'validation scores stats:\n{df.describe()}')
-            self._logger.info(f'validation scores stats (per glacier):\n'
-                              f'{df.groupby("gid").mean(numeric_only=True).describe()}')
 
         # export the stats if needed
         if self.outdir is not None:
@@ -171,8 +153,8 @@ class GlSegTask(pl.LightningModule):
             fp = self.outdir / 'stats.csv'
             df.to_csv(fp)
             self._logger.info(f'Stats exported to {str(fp)}')
-            fp = self.outdir / 'stats_avg_per_glacier.csv'
-            df.groupby('gid').mean(numeric_only=True).to_csv(fp)
+            fp = self.outdir / 'stats_avg_per_event.csv'
+            df.groupby('entry_id').mean(numeric_only=True).to_csv(fp)
             self._logger.info(f'Stats per glacier exported to {str(fp)}')
 
         # show the epoch as the x-coordinate
@@ -184,7 +166,7 @@ class GlSegTask(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         y_pred = self(batch)
-        y_true = batch['mask_all_g'].type(y_pred.dtype).unsqueeze(dim=1)
+        y_true = batch['mask_all'].type(y_pred.dtype).unsqueeze(dim=1)
         mask = ~batch['mask_no_data'].unsqueeze(dim=1)
         loss_samplewise = self.loss(preds=y_pred, targets=y_true, mask=mask, samplewise=True)
 
@@ -209,11 +191,11 @@ class GlSegTask(pl.LightningModule):
         # ensure that all the predictions are for the same glacier
         if len(set(filepaths)) > 1:
             raise NotImplementedError
-        cube_fp = filepaths[0]
+        cube_fp = Path(filepaths[0])
 
         # read the original glacier nc and create accumulators based on its shape
         nc = xr.open_dataset(cube_fp, decode_coords='all')
-        preds_acc = torch.zeros(nc.mask_crt_g.shape).to(self.device)
+        preds_acc = torch.zeros(nc.mask_all.shape).to(self.device)
         preds_cnt = torch.zeros(size=preds_acc.shape).to(self.device)
         for j in range(len(self.test_step_outputs)):
             preds = self.test_step_outputs[j]['preds']
@@ -241,9 +223,11 @@ class GlSegTask(pl.LightningModule):
         nc_pred['pred_b'] = (('y', 'x'), preds_acc_np >= 0.5)
         nc_pred['pred_b'].rio.write_crs(nc_pred.rio.crs, inplace=True)
 
-        rgi_id = Path(cube_fp).parent.parent.name
-        gl_num = Path(cube_fp).parent.name
-        cube_pred_fp = Path(self.outdir) / rgi_id / f'{gl_num}.nc'
+        # mask-out the predictions outside the ROI
+        nc_pred['pred_b_masked'] = nc_pred.pred_b & (nc_pred.mask_data_ok == 1)
+        nc_pred['pred_b_masked'].rio.write_crs(nc_pred.rio.crs, inplace=True)
+
+        cube_pred_fp = Path(self.outdir) / cube_fp.name
         cube_pred_fp.parent.mkdir(parents=True, exist_ok=True)
         cube_pred_fp.unlink(missing_ok=True)
         nc_pred.to_netcdf(cube_pred_fp)

@@ -21,7 +21,8 @@ class GlSegTask(pl.LightningModule):
             tm.JaccardIndex(threshold=0.5, task='binary'),
             tm.Precision(threshold=0.5, task='binary'),
             tm.Recall(threshold=0.5, task='binary'),
-            tm.F1Score(threshold=0.5, task='binary')
+            tm.F1Score(threshold=0.5, task='binary'),
+            tm.ConfusionMatrix(threshold=0.5, task='binary'),
         ])
         self.optimizer_settings = task_params['optimization']['optimizer']
         self.lr_scheduler_settings = task_params['optimization']['lr_schedule']
@@ -44,6 +45,8 @@ class GlSegTask(pl.LightningModule):
             getattr(torch.optim, o['name'])(self.parameters(), **o['args'])
             for o in self.optimizer_settings
         ]
+        if self.lr_scheduler_settings is None:
+            return optimizers
         schedulers = [
             getattr(torch.optim.lr_scheduler, s['name'])(optimizers[i], **s['args'])
             for i, s in enumerate(self.lr_scheduler_settings)
@@ -60,13 +63,22 @@ class GlSegTask(pl.LightningModule):
                 m = {k: torch.nan for k in self.val_metrics}
             val_metrics_samplewise.append(m)
 
-        # restructure the output in a single dict {metric: list}
-        val_metrics_samplewise = {
-            k: torch.tensor([x[k] for x in val_metrics_samplewise], device=y_true.device)
-            for k in val_metrics_samplewise[0].keys()
-        }
+        # restructure the output in a single dict {metric: list}; split the confusion matrix into its components
+        val_metrics_samplewise_dict = {}
+        for k in val_metrics_samplewise[0].keys():
+            if k != 'BinaryConfusionMatrix':
+                # get rid of the Binary
+                new_k = k.replace('Binary', '')
+                val_metrics_samplewise_dict[new_k] = torch.tensor(
+                    [x[k] for x in val_metrics_samplewise], device=y_true.device
+                )
+            else:
+                for (i, j), new_k in zip(((0, 0), (0, 1), (1, 0), (1, 1)), ('TN', 'FP', 'FN', 'TP')):
+                    val_metrics_samplewise_dict[new_k] = torch.tensor(
+                        [x[k][i, j] for x in val_metrics_samplewise], device=y_true.device
+                    )
 
-        return val_metrics_samplewise
+        return val_metrics_samplewise_dict
 
     def aggregate_step_metrics(self, step_outputs, split_name):
         # extract the glacier name from the patch filepath
@@ -78,11 +90,25 @@ class GlSegTask(pl.LightningModule):
         for m in step_outputs[0]['metrics']:
             df[m] = torch.stack([y for x in step_outputs for y in x['metrics'][m]]).cpu().numpy()
 
-        # summarize the metrics per glacier
         avg_tb_logs = {}
         stats_per_event = df.groupby('entry_id').mean(numeric_only=True)
         for m in stats_per_event.columns:
-            avg_tb_logs[f'{m}_{split_name}_epoch_avg_per_e'] = stats_per_event[m].mean()
+            if m not in ['TP', 'FP', 'FN', 'TN']:
+                # summarize the metrics per glacier
+                avg_tb_logs[f'{m}_{split_name}_epoch_avg_per_e'] = stats_per_event[m].mean()
+            else:
+                # summarize the metrics for all the glaciers
+                tp = df['TP'].sum()
+                fp = df['FP'].sum()
+                fn = df['FN'].sum()
+                precision = tp / (tp + fp)
+                recall = tp / (tp + fn)
+                f1 = 2 * tp / (2 * tp + fp + fn)
+                iou = tp / (tp + fp + fn)
+                avg_tb_logs[f'Precision_{split_name}_epoch_global'] = precision
+                avg_tb_logs[f'Recall_{split_name}_epoch_global'] = recall
+                avg_tb_logs[f'F1Score_{split_name}_epoch_global'] = f1
+                avg_tb_logs[f'JaccardIndex_{split_name}_epoch_global'] = iou
 
         return avg_tb_logs, df
 
@@ -146,17 +172,6 @@ class GlSegTask(pl.LightningModule):
         with pd.option_context('display.max_rows', 10, 'display.max_columns', None, 'display.width', None):
             self._logger.info(f'validation scores stats:\n{df.describe()}')
 
-        # export the stats if needed
-        if self.outdir is not None:
-            self.outdir = Path(self.outdir)
-            self.outdir.mkdir(parents=True, exist_ok=True)
-            fp = self.outdir / 'stats.csv'
-            df.to_csv(fp)
-            self._logger.info(f'Stats exported to {str(fp)}')
-            fp = self.outdir / 'stats_avg_per_event.csv'
-            df.groupby('entry_id').mean(numeric_only=True).to_csv(fp)
-            self._logger.info(f'Stats per glacier exported to {str(fp)}')
-
         # show the epoch as the x-coordinate
         avg_tb_logs['step'] = float(self.current_epoch)
         self.log_dict(avg_tb_logs, on_step=False, on_epoch=True, sync_dist=True)
@@ -185,6 +200,14 @@ class GlSegTask(pl.LightningModule):
         return res
 
     def on_test_epoch_end(self):
+        # display the metrics and export them
+        avg_tb_logs, df = self.aggregate_step_metrics(self.test_step_outputs, split_name='test')
+
+        # show the stats
+        with pd.option_context('display.max_rows', 10, 'display.max_columns', None, 'display.width', None):
+            self._logger.info(f'test scores stats:\n{df.describe()}')
+            self._logger.info(f'aggregated stats:\n{avg_tb_logs}')
+
         # collect all filepaths
         filepaths = [y for x in self.test_step_outputs for y in x['filepaths']]
 

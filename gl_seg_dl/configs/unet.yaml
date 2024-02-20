@@ -1,16 +1,16 @@
 data:
-  data_root_dir: '../data/external/patches_orig_r_64_s_32/split_1'
-  train_dir_name: 'fold_train'
+  data_root_dir: '../data/external/wd/patches_orig_r_64_s_32/split_1'
+  train_dir_name: 'fold_train/event'
   val_dir_name: 'fold_valid'
   test_dir_name: 'fold_test'
   rasters_dir: '../data/s2_data/rasters'
   minmax_scale_data: False
   standardize_data: False
   scale_each_band: True
-  data_stats_fp: '../data/external/s2_data/aux_data/patches_orig_r_128_s_128/split_1/stats_train_patches_agg.csv'
-  train_batch_size: 16
-  val_batch_size: 32
-  test_batch_size: 32
+  data_stats_fp: null
+  train_batch_size: 32
+  val_batch_size: 256
+  test_batch_size: 256
   num_workers: 16
 
 task:
@@ -26,15 +26,11 @@ task:
         args:
           lr: 0.01
           nesterov: True
-          momentum: 0.95
-    lr_schedule:
-      - name: 'MultiStepLR'
-        args:
-          milestones: [ 10, 25 ]
-          gamma: 0.1
+          momentum: 0.9
+    lr_schedule: null
 
 logger:
-  save_dir: '../data/external/scratch/experiments_server'
+  save_dir: '../data/external/experiments_server'
   name: 'unet/cv/split_1'
 
 trainer:
@@ -50,7 +46,7 @@ model:
   class: 'SegModel'
   name: 'Unet'
   inputs:
-    elevation: False
+    elevation: True
   args:
     encoder_name: 'resnet34'
     encoder_weights: 'imagenet'

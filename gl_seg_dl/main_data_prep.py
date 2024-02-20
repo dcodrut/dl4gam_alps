@@ -7,8 +7,9 @@ import rasterio
 import numpy as np
 
 # local imports
-from utils.sampling_utils import patchify_data, data_cv_split
+from utils.sampling_utils import patchify_raster, data_cv_split
 from utils.data_prep import add_extra_mask
+from utils.general import run_in_parallel
 import config as C
 
 if __name__ == "__main__":
@@ -90,13 +91,24 @@ if __name__ == "__main__":
     df_all.to_csv(fp, index=False)
     print(f"Dataframe with the split-fold mapping saved to {fp}")
 
-    # extract patches
-    patchify_data(
-        rasters_dir=C.S1.DIR_NC_RASTERS,
+    # prepare the list of rasters to be patchified
+    fp_list = sorted(list((Path(C.S1.DIR_NC_RASTERS).glob('**/*.nc'))))
+    assert len(fp_list) > 0, f'No netcdf files found in {fp_list}'
+
+    # assign a unique seed to each, to increase the chances that sampled patches are different
+    seed_list = [42 + i for i in range(len(fp_list))]
+
+    # patchify the data in parallel
+    run_in_parallel(
+        patchify_raster,
+        fp=fp_list,
         outlines_split_dir=C.S1.DIR_OUTLINES_SPLIT,
         num_folds=C.S1.NUM_CV_FOLDS,
         patches_dir=C.S1.DIR_GL_PATCHES,
         patch_radius=C.S1.PATCH_RADIUS,
         sampling_step=C.S1.SAMPLING_STEP,
-        max_n_samples_per_event=10
+        max_n_samples_per_event=10,
+        num_cores=C.S1.NUM_CORES_PREP_DATA,
+        seed=seed_list,
+        pbar=True
     )

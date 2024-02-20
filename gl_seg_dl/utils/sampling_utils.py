@@ -181,15 +181,15 @@ def get_df_sampling_buffers(df, patch_radius, gsd, min_sampling_margin):
     return df_sampling_buffer
 
 
-def patchify_data(rasters_dir, outlines_split_dir, num_folds, patches_dir, patch_radius, sampling_step,
-                  max_n_samples_per_event):
+def patchify_raster(fp, outlines_split_dir, num_folds, patches_dir, patch_radius, sampling_step,
+                    max_n_samples_per_event, seed, pbar=False):
     """
     Using the get_patches_gdf function, it exports patches to disk for each cross-validation split, with each split
     separated into training-validation-test.
     When generating the patches, add_centroid and add_extremes will be set to True (see get_patches_gdf), which means
     at least five patches will be generated per contour.
 
-    :param rasters_dir: directory containing the raster netcdf files
+    :param fp: netcdf file containing the raster to be patchified
     :param outlines_split_dir: directory containing the cross-validation splits
     :param num_folds: number of cross-validation folds
     :param patches_dir: output directory where the extracted patches will be saved
@@ -198,12 +198,14 @@ def patchify_data(rasters_dir, outlines_split_dir, num_folds, patches_dir, patch
                           if smaller than 2 * patch_radius, then patches will overlap
     :param max_n_samples_per_event: maximum number patches to sample for each contour (note that is not guaranteed that
                                     this number of patches will be reached)
+    :param seed: random seed for patch sampling
+    :param pbar: whether to show the progress bar while exporting the patches for each split-fold-event
     :return:
     """
-    fp_list = sorted(list((Path(rasters_dir).glob('**/*.nc'))))
-    assert len(fp_list) > 0, f'No netcdf files found in {rasters_dir}'
 
-    rs = np.random.RandomState(seed=42)
+    # read the image data
+    nc = xr.open_dataset(fp, decode_coords='all')
+
     for i_split in range(1, num_folds + 1):
         for crt_fold in ['train', 'valid', 'test']:
             # for crt_fold in ['test']:
@@ -211,90 +213,89 @@ def patchify_data(rasters_dir, outlines_split_dir, num_folds, patches_dir, patch
             df_crt_fold = gpd.read_file(outlines_split_fp)
             df_crt_fold.fn = df_crt_fold.fn.apply(lambda s: s.replace('-', '_'))
 
-            for crt_fp in tqdm(fp_list, desc=f'split = {i_split} / {num_folds}; fold = {crt_fold}'):
-                # read the image data
-                nc = xr.open_dataset(crt_fp, decode_coords='all')
+            # keep only the contours of the current image and project them to the same CRS
+            fn_to_match = fp.stem.split('GEE_')[1]
+            df_crt_img = df_crt_fold[df_crt_fold.fn == fn_to_match].copy()
+            df_crt_img = df_crt_img.to_crs(nc.rio.crs)
 
-                # keep only the contours of the current image and project them to the same CRS
-                fn_to_match = crt_fp.stem.split('GEE_')[1]
-                df_crt_img = df_crt_fold[df_crt_fold.fn == fn_to_match].copy()
-                df_crt_img = df_crt_img.to_crs(nc.rio.crs)
+            # for each event from the current image
+            for event_id in df_crt_img.id:
+                df_crt_event = df_crt_img[df_crt_img.id == event_id]
 
-                # for each event from the current image
-                for event_id in df_crt_img.id:
-                    df_crt_event = df_crt_img[df_crt_img.id == event_id]
+                # add the rasterized contour only of the current event to the dataset
+                nc = add_extra_mask(nc_data=nc, mask_name='mask_crt', gdf=df_crt_event)
 
-                    # add the rasterized contour only of the current event to the dataset
-                    nc = add_extra_mask(nc_data=nc, mask_name='mask_crt', gdf=df_crt_event)
+                # get the sampling buffers around the current event
+                df_crt_fold_sampling_buffer = get_df_sampling_buffers(
+                    df=df_crt_event, patch_radius=patch_radius, gsd=10, min_sampling_margin=2
+                )
 
-                    # get the sampling buffers around the current event
-                    df_crt_fold_sampling_buffer = get_df_sampling_buffers(
-                        df=df_crt_event, patch_radius=patch_radius, gsd=10, min_sampling_margin=2
-                    )
+                # prepare a rasterized mask for the sampling buffer (around the contours)
+                _m = nc.band_data.isel(band=0).rio.clip(df_crt_fold_sampling_buffer.geometry, drop=False).values
+                sampling_mask = (~np.isnan(_m)).astype(np.int8)
 
-                    # prepare a rasterized mask for the sampling buffer (around the contours)
-                    _m = nc.band_data.isel(band=0).rio.clip(df_crt_fold_sampling_buffer.geometry, drop=False).values
-                    sampling_mask = (~np.isnan(_m)).astype(np.int8)
+                # get the locations of the sampled patches
+                patches_df = get_patches_gdf(
+                    nc=nc,
+                    sampling_mask=sampling_mask,
+                    sampling_step=sampling_step,
+                    patch_radius=patch_radius,
+                    add_center=False,
+                    add_centroid=True,
+                    add_extremes=True
+                )
+                if patches_df is None:
+                    print(f"No patches for {fn_to_match} - event {event_id}")
+                    continue
+                patches_df['sample_type'] = 'event'
 
-                    # get the locations of the sampled patches
-                    patches_df = get_patches_gdf(
-                        nc=nc,
-                        sampling_mask=sampling_mask,
-                        sampling_step=sampling_step,
-                        patch_radius=patch_radius,
-                        add_center=False,
-                        add_centroid=True,
-                        add_extremes=True
-                    )
-                    if patches_df is None:
-                        print(f"No patches for {fn_to_match} - event {event_id}")
-                        continue
-                    patches_df['sample_type'] = 'event'
+                n_sample = max_n_samples_per_event // 2
+                if len(patches_df) > n_sample:
+                    patches_df = patches_df.sample(n_sample, replace=False, random_state=seed)
 
-                    n_sample = max_n_samples_per_event // 2
-                    if len(patches_df) > n_sample:
-                        patches_df = patches_df.sample(n_sample, replace=False, random_state=rs)
+                # sample also some bg patches, using a (larger) buffer around the objects from the other images
+                # TODO: make this faster, too many patches are being initially generated and then dropped
+                df_bg = df_crt_fold[df_crt_fold.fn != fn_to_match].copy()
+                df_bg = df_bg.to_crs(nc.rio.crs)
+                df_crt_fold_sampling_bg = get_df_sampling_buffers(
+                    df=df_bg, patch_radius=patch_radius * 2, gsd=10, min_sampling_margin=2
+                )
 
-                    # sample also some bg patches, using a (larger) buffer around the objects from the other images
-                    # TODO: make this faster, too many patches are being initially generated and then dropped
-                    df_bg = df_crt_fold[df_crt_fold.fn != fn_to_match].copy()
-                    df_bg = df_bg.to_crs(nc.rio.crs)
-                    df_crt_fold_sampling_bg = get_df_sampling_buffers(
-                        df=df_bg, patch_radius=patch_radius * 2, gsd=10, min_sampling_margin=2
-                    )
+                # prepare a rasterized mask for the sampling buffer (around the contours)
+                _m = nc.band_data.isel(band=0).rio.clip(df_crt_fold_sampling_bg.geometry, drop=False).values
+                sampling_mask_bg = (~np.isnan(_m)).astype(np.int8)
 
-                    # prepare a rasterized mask for the sampling buffer (around the contours)
-                    _m = nc.band_data.isel(band=0).rio.clip(df_crt_fold_sampling_bg.geometry, drop=False).values
-                    sampling_mask_bg = (~np.isnan(_m)).astype(np.int8)
+                # get the locations of the sampled patches
+                patches_df_bg = get_patches_gdf(
+                    nc=nc,
+                    sampling_mask=sampling_mask_bg,
+                    sampling_step=sampling_step,
+                    patch_radius=patch_radius,
+                    add_center=False,
+                    add_centroid=True,
+                    add_extremes=True
+                )
+                patches_df_bg['sample_type'] = 'no_event'
+                n_sample = min(max_n_samples_per_event // 2, len(patches_df))
+                if len(patches_df_bg) > n_sample:
+                    patches_df_bg = patches_df_bg.sample(n_sample, replace=False, random_state=seed)
 
-                    # get the locations of the sampled patches
-                    patches_df_bg = get_patches_gdf(
-                        nc=nc,
-                        sampling_mask=sampling_mask_bg,
-                        sampling_step=sampling_step,
-                        patch_radius=patch_radius,
-                        add_center=False,
-                        add_centroid=True,
-                        add_extremes=True
-                    )
-                    patches_df_bg['sample_type'] = 'no_event'
-                    n_sample = min(max_n_samples_per_event // 2, len(patches_df))
-                    if len(patches_df_bg) > n_sample:
-                        patches_df_bg = patches_df_bg.sample(n_sample, replace=False, random_state=rs)
+                patches_df_all = pd.concat((patches_df, patches_df_bg))
 
-                    patches_df_all = pd.concat((patches_df, patches_df_bg))
+                # build the patches
+                pbar_desc = (
+                    f"Exporting patches "
+                    f"(fold = {crt_fold}; split = {i_split}; image = {fn_to_match}; event = {event_id})"
+                )
+                for i in tqdm(range(len(patches_df_all)), desc=pbar_desc, disable=not pbar):
+                    patch_shp = patches_df_all.iloc[i:i + 1]
+                    crt_s2_data = nc.rio.clip(patch_shp.geometry)
 
-                    # build the patches
-                    pbar_desc = f"Exporting patches for image {fn_to_match} - event {event_id}"
-                    for i in tqdm(range(len(patches_df_all)), desc=pbar_desc):
-                        patch_shp = patches_df_all.iloc[i:i + 1]
-                        crt_s2_data = nc.rio.clip(patch_shp.geometry)
+                    r = patch_shp.iloc[0]
+                    fn = f'{fn_to_match}_patch_{i}_xc_{r.x_center}_yc_{r.y_center}.nc'
 
-                        r = patch_shp.iloc[0]
-                        fn = f'{fn_to_match}_patch_{i}_xc_{r.x_center}_yc_{r.y_center}.nc'
+                    patch_fp = Path(patches_dir) / f'split_{i_split}' / f'fold_{crt_fold}'
+                    patch_fp = patch_fp / r.sample_type / event_id / fn
+                    patch_fp.parent.mkdir(parents=True, exist_ok=True)
 
-                        patch_fp = Path(patches_dir) / f'split_{i_split}' / f'fold_{crt_fold}'
-                        patch_fp = patch_fp / r.sample_type / event_id / fn
-                        patch_fp.parent.mkdir(parents=True, exist_ok=True)
-
-                        crt_s2_data.to_netcdf(patch_fp)
+                    crt_s2_data.to_netcdf(patch_fp)

@@ -59,8 +59,8 @@ def train_model(settings: dict):
 
     # Callbacks
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        monitor='BinaryJaccardIndex_val_epoch_avg_per_e',
-        filename='ckpt-{epoch:02d}-{BinaryJaccardIndex_val_epoch_avg_per_e:.4f}',
+        monitor='JaccardIndex_val_epoch_avg_per_e',
+        filename='ckpt-{epoch:02d}-{JaccardIndex_val_epoch_avg_per_e:.4f}',
         save_top_k=1,
         save_last=True,
         mode='max',

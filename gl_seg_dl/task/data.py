@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from typing import Union
 
@@ -150,14 +149,30 @@ class GlSegPatchDataset(Dataset):
 
 
 class GlSegDataset(GlSegPatchDataset):
-    def __init__(self, fp, **kwargs):
+    def __init__(self, fp, spatial_extent=None, **kwargs):
         self.fp = fp
         super().__init__(folder=None, fp_list=[fp], **kwargs)
 
         # get all possible patches for the current entry
-        self.nc = xr.open_dataset(fp, decode_coords='all').load()
+        self.nc = xr.open_dataset(fp, decode_coords='all')
+
+        # cut the raster if needed
+        if spatial_extent is not None:
+            self.nc = self.nc.rio.clip([spatial_extent])
+
+            # export it to a temporary file (will be needed in on_test_epoch_end)
+            i = fp.parts.index('rasters')
+            self.fp = Path(*fp.parts[:i]) / 'rasters_tmp_test' / fp.stem / Path(*fp.parts[i + 1:])
+            self.fp.parent.mkdir(parents=True, exist_ok=True)
+            self.nc.to_netcdf(self.fp)
+
+        # load the data (TODO: this seemed to be faster but should check and maybe parametrize to avoid OOMs)
+        self.nc = self.nc.load()
+
         self.nc['mask_crt'] = self.nc['mask_all']
-        sampling_mask = np.ones_like(self.nc.mask_all).astype(bool)
+
+        # sampling patches from the entire image, if there is data
+        sampling_mask = (self.nc.mask_data_ok.values == 1).astype(bool)
         self.patches_df = get_patches_gdf(self.nc, patch_radius=64, sampling_step=32, sampling_mask=sampling_mask)
 
     def __getitem__(self, idx):
@@ -252,7 +267,7 @@ class GlSegDataModule(pl.LightningDataModule):
                 data_stats_df=self.data_stats_df
             )
 
-    def setup_dl_per_image(self, gid_list=None):
+    def setup_dl_per_image(self, gid_list=None, spatial_extent=None):
         # get the directory of the full images
         cubes_dir = Path(self.rasters_dir)
         assert cubes_dir.exists()
@@ -273,7 +288,8 @@ class GlSegDataModule(pl.LightningDataModule):
                     standardize_data=self.standardize_data,
                     minmax_scale_data=self.minmax_scale_data,
                     scale_each_band=self.scale_each_band,
-                    data_stats_df=self.data_stats_df
+                    data_stats_df=self.data_stats_df,
+                    spatial_extent=spatial_extent
                 )
             )
 
@@ -309,8 +325,8 @@ class GlSegDataModule(pl.LightningDataModule):
             drop_last=False
         )
 
-    def test_dataloaders_per_image(self, gid_list):
-        test_ds_list = self.setup_dl_per_image(gid_list=gid_list)
+    def test_dataloaders_per_image(self, gid_list, spatial_extent=None):
+        test_ds_list = self.setup_dl_per_image(gid_list=gid_list, spatial_extent=spatial_extent)
 
         dloaders = []
         for ds in test_ds_list:

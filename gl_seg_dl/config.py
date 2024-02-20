@@ -8,10 +8,11 @@ class S1:
     DIR_OUTLINES_SPLIT = f'{WD}/outlines_split'
     NUM_CV_FOLDS = 5
     VALID_FRACTION = 0.15
-    DIR_NC_RASTERS = f'{WD}/rasters'
+    DIR_NC_RASTERS = f'{WD}/rasters/v3'
     # DIR_NC_RASTERS = f'{DIR}/rasters_cropped_test_cv_1'
     MIN_GLACIER_AREA = 0.1  # km2
     DIRS_INFER = [DIR_NC_RASTERS]  # directories on which to make glacier-wide inferences
+    NUM_CORES_PREP_DATA = 32
     NUM_CORES_EVAL = 16
 
     # patch sampling settings

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import geopandas as gpd
-import pandas as pd
+import shapely
 import pytorch_lightning as pl
 import yaml
 from tqdm import tqdm
@@ -24,7 +24,7 @@ root_logger.handlers[0].setFormatter(logging.Formatter(fmt))
 logger = logging.getLogger('pytorch_lightning.core')
 
 
-def test_model(settings, fold, test_per_entry=False, glacier_id_list=None, checkpoint=None):
+def test_model(settings, fold, test_per_entry=False, spatial_extent=None, checkpoint=None):
     logger.info(f'Settings: {settings}')
 
     # Data
@@ -89,11 +89,11 @@ def test_model(settings, fold, test_per_entry=False, glacier_id_list=None, check
     else:
         dir_fp = Path(dm.rasters_dir)
         logger.info(f'Reading the entries IDs based on the rasters from {dir_fp}')
-        fp_list = list(dir_fp.glob('**/*.nc'))
+        fp_list = list(dir_fp.glob('**/*.nc'))[:2]
         glacier_id_list_crt_dir = set([p.name for p in fp_list])
         logger.info(f'#entries in the current rasters dir = {len(glacier_id_list_crt_dir)}')
 
-        dl_list = dm.test_dataloaders_per_image(gid_list=glacier_id_list_crt_dir)
+        dl_list = dm.test_dataloaders_per_image(gid_list=glacier_id_list_crt_dir, spatial_extent=spatial_extent)
         for dl in tqdm(dl_list, desc='Testing per glacier'):
             trainer.test(model=task, dataloaders=dl)
 
@@ -143,7 +143,7 @@ if __name__ == "__main__":
         # get the best checkpoint
         checkpoint_file = get_best_model_ckpt(
             checkpoint_dir=args.checkpoint_dir,
-            metric_name='BinaryJaccardIndex_val_epoch_avg_per_e',
+            metric_name='JaccardIndex_val_epoch_avg_per_e',
             sort_method='max'
         )
     else:
@@ -169,22 +169,25 @@ if __name__ == "__main__":
     else:
         infer_dir_list = C.S1.DIRS_INFER
 
-    # choose the entries for the specified fold using the given shapefile
+    # choose the entries for the specified fold using the corresponding shapefile
     entry_ids = None
     if args.test_per_entry:
-        assert args.split_fp is not None
-        fp = Path(args.split_fp)
-        assert fp.suffix in ('.csv', '.shp')
-        logger.info(f"Reading the split dataframe from {fp}")
-        split_df = gpd.read_file(fp, dtype={'entry_id': str})
-
         # get the split on which the current model was trained on
         split_name = f"split_{str(checkpoint_file).split('split_')[1].split('/')[0]}"
 
-        # get the list of entries for the specified fold
+        # get the fold name
         fold_name = f"fold_{args.fold[2:]}"
-        entry_ids = sorted(list(split_df[split_df[split_name] == fold_name].entry_id))
-        logger.info(f"split = {split_name}; fold = {fold_name}; #entries = {len(entry_ids)}")
+
+        # get the list of entries for the specified fold
+        fp = Path(C.S1.DIR_OUTLINES_SPLIT) / split_name / f"{fold_name}.shp"
+        split_gdf = gpd.read_file(fp)
+        logger.info(f"split = {split_name}; fold = {fold_name}; #entries = {len(split_gdf)}")
+
+        # get the spatial extent of the events which will be used to crop out the rasters before inference
+        spatial_extent = shapely.geometry.box(*shapely.unary_union(split_gdf.geometry).bounds)
+
+        # add a buffer to include all the patches
+        spatial_extent = shapely.geometry.box(*spatial_extent.buffer(C.S1.PATCH_RADIUS * 10).bounds)
 
     for infer_dir in infer_dir_list:
         assert Path(infer_dir).exists(), f"{infer_dir} does not exist"
@@ -193,6 +196,6 @@ if __name__ == "__main__":
             settings=all_settings,
             checkpoint=checkpoint_file,
             test_per_entry=args.test_per_entry,
-            glacier_id_list=entry_ids,
+            spatial_extent=spatial_extent,
             fold=args.fold,
         )

@@ -17,6 +17,11 @@ def compute_stats(filepath):
     y_pred = (nc.pred_b_masked.values == 1)
     y_true = (nc.mask_all.values == 1)
 
+    # apply the mask
+    mask_ok = (nc.mask_data_ok.values == 1)
+    y_true = y_true[mask_ok]
+    y_pred = y_pred[mask_ok]
+
     tp = (y_true & (y_pred == y_true)).sum()
     tn = (~y_true & (y_pred == y_true)).sum()
     fp = (~y_true & y_pred).sum()

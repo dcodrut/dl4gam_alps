@@ -89,7 +89,7 @@ def test_model(settings, fold, test_per_entry=False, spatial_extent=None, checkp
     else:
         dir_fp = Path(dm.rasters_dir)
         logger.info(f'Reading the entries IDs based on the rasters from {dir_fp}')
-        fp_list = list(dir_fp.glob('**/*.nc'))[:2]
+        fp_list = list(dir_fp.glob('**/*.nc'))
         glacier_id_list_crt_dir = set([p.name for p in fp_list])
         logger.info(f'#entries in the current rasters dir = {len(glacier_id_list_crt_dir)}')
 

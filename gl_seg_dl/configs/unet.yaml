@@ -1,6 +1,6 @@
 data:
   data_root_dir: '../data/external/wd/patches_orig_r_64_s_32/split_1'
-  train_dir_name: 'fold_train/event'
+  train_dir_name: 'fold_train'
   val_dir_name: 'fold_valid'
   test_dir_name: 'fold_test'
   rasters_dir: '../data/s2_data/rasters'

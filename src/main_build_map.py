@@ -51,24 +51,79 @@ def simplify_geoms(geom, num_decimals=5):
 
 
 if __name__ == "__main__":
+    # set all the required paths
+    ds_train = 's2_alps_plus'
+    ds_infer = 's2_alps_plus'
+    model_root_dir = Path(f"../data/external/_experiments/{ds_train}/unet")
+    model_version = 'version_0'
+    polys_root_dir = model_root_dir / 'gdf_all_splits' / 'seed_all' / model_version / ds_infer
+    stats_root_dir = model_root_dir / 'stats_all_splits'
+    use_calibrated = True  # use the calibrated predictions by default
+    preds_name = 'preds_calib' if use_calibrated else 'preds'
+    stats_name = 'stats_calib' if use_calibrated else 'stats'
+    all_paths = {
+        'inventory': '../data/outlines/paul_et_al_2020/c3s_gi_rgi11_s2_2015_v2.shp',
+        'img_dates': '../data/inv_images_qc/final_dates.csv',
+        'preds_0': polys_root_dir / 'inv' / f"inv_{preds_name}.shp",
+        'preds_0_low': polys_root_dir / 'inv' / f"inv_{preds_name}_low.shp",
+        'preds_0_high': polys_root_dir / 'inv' / f"inv_{preds_name}_high.shp",
+        'preds_1': polys_root_dir / '2023' / f"2023_{preds_name}.shp",
+        'preds_1_low': polys_root_dir / '2023' / f"2023_{preds_name}_low.shp",
+        'preds_1_high': polys_root_dir / '2023' / f"2023_{preds_name}_high.shp",
+        'stats_changes': stats_root_dir / f"df_changes_{stats_name}_all_{ds_infer}_{model_version}_ensemble.csv",
+    }
+    for k, v in all_paths.items():
+        all_paths[k] = Path(v)
+        assert all_paths[k].exists(), f"Path not found: {all_paths[k]}"
+
+    # give a layer name to each dataframe (will be used for the layer control)
+    gdf_layer_names = {
+        'gdf_inv': 'Inventory 2015/16/17 (Paul et al. 2020)',
+        'gdf_pred_0': 'DL4GAM prediction 2015/16/17',
+        'gdf_pred_1': 'DL4GAM prediction 2023',
+        'gdf_pred_0_unc': 'DL4GAM 1σ-uncertainty 2015/16/17',
+        'gdf_pred_1_unc': 'DL4GAM 1σ-uncertainty 2023',
+    }
+
+    # add an information box
+    link_paper = 'https://essopenarchive.org/users/873367/articles/1253678-dl4gam-a-multi-modal-deep-learning-based-framework-for-glacier-area-monitoring-trained-and-validated-on-the-european-alps'
+    link_repo = 'https://github.com/dcodrut/dl4gam_alps'
+    info_html = f"""
+    <div id="info-box" style="position: fixed; top: 10px; left: 50px; width: auto; 
+    background-color: white; border: 2px solid black; padding: 10px; z-index: 1000;">
+        <button onclick="document.getElementById('info-box').style.display='none'" style="float: right;">x</button>
+        <b>Information:</b><br><br>
+        <ul>
+            <li>Use the layer control to switch between the different map layers
+                <br> or to show the 1σ-uncertainty as a shaded area for the DL4GAM predictions.</li>
+            <li>Click on the markers for more information on each glacier
+                <br> - incl. whether the estimated change passed our automatic quality control (QC).</li>
+            <li>Note that the contours were slightly undersampled to save space.</li>
+            <li>For more details on the model and the dataset, check our  
+                    <a href="{link_paper}" target="_blank">paper</a>
+                 and the  
+                    <a href="{link_repo}" target="_black">repository</a>.
+            </li>
+        </ul>
+    </div>
+    """
+
     # read the inventory
-    gdf_inv = gpd.read_file('../data/outlines/paul_et_al_2020/c3s_gi_rgi11_s2_2015_v2.shp')
+    gdf_inv = gpd.read_file(all_paths['inventory'])
 
     # keep only the glaciers covered in our dataset
-    df_final_dates = pd.read_csv('../data/inv_images_qc/final_dates.csv')
+    df_final_dates = pd.read_csv(all_paths['img_dates'])
     gdf_inv = gdf_inv[gdf_inv.entry_id.isin(df_final_dates.entry_id)]
 
-    # read the predictions
-    polys_root_dir = Path(
-        '../data/external/_experiments/s2_alps_plus/unet/gdf_all_splits/seed_all/version_0/s2_alps_plus')
-    gdf_pred_0 = gpd.read_file(polys_root_dir / 'inv/inv_pred.shp')
-    gdf_pred_1 = gpd.read_file(polys_root_dir / '2023/2023_pred.shp')
+    # read the (average) predictions for the two epochs
+    gdf_pred_0 = gpd.read_file(all_paths['preds_0'])
+    gdf_pred_1 = gpd.read_file(all_paths['preds_1'])
 
     # read the lower and upper bounds
-    gdf_pred_lb_0 = gpd.read_file(polys_root_dir / 'inv/inv_pred_low_two_sd.shp')
-    gdf_pred_ub_0 = gpd.read_file(polys_root_dir / 'inv/inv_pred_high_two_sd.shp')
-    gdf_pred_lb_1 = gpd.read_file(polys_root_dir / '2023/2023_pred_low_two_sd.shp')
-    gdf_pred_ub_1 = gpd.read_file(polys_root_dir / '2023/2023_pred_high_two_sd.shp')
+    gdf_pred_lb_0 = gpd.read_file(all_paths['preds_0_low'])
+    gdf_pred_ub_0 = gpd.read_file(all_paths['preds_0_high'])
+    gdf_pred_lb_1 = gpd.read_file(all_paths['preds_1_low'])
+    gdf_pred_ub_1 = gpd.read_file(all_paths['preds_1_high'])
 
     # add the area in km2 and then convert to WGS84
     for df in [gdf_inv, gdf_pred_0, gdf_pred_1, gdf_pred_lb_0, gdf_pred_ub_0, gdf_pred_lb_1, gdf_pred_ub_1]:
@@ -85,7 +140,7 @@ if __name__ == "__main__":
     gdf_pred_1_unc = gdf_pred_1_unc.drop(columns=['geometry_lb', 'geometry_ub'])
 
     # read the processed rates
-    df_rates = pd.read_csv('../data/external/_experiments/s2_alps_plus/unet/stats_rates_s2_alps_plus_version_0.csv')
+    df_rates = pd.read_csv(all_paths['stats_changes'])
 
     # make sure all the dataframes have the same glaciers
     covered_glaciers = set(gdf_inv.entry_id)
@@ -94,15 +149,6 @@ if __name__ == "__main__":
     assert covered_glaciers == set(gdf_pred_0_unc.entry_id)
     assert covered_glaciers == set(gdf_pred_1_unc.entry_id)
     assert covered_glaciers.issubset(set(df_rates.entry_id))  # the rates also include the extrapolations
-
-    # give a layer name to each dataframe (will be used for the layer control)
-    gdf_layer_names = {
-        'gdf_inv': 'Inventory 2015/16/17 (Paul et al. 2020)',
-        'gdf_pred_0': 'DL4GAM prediction 2015/16/17',
-        'gdf_pred_1': 'DL4GAM prediction 2023',
-        'gdf_pred_0_unc': 'DL4GAM 1σ-uncertainty 2015/16/17',
-        'gdf_pred_1_unc': 'DL4GAM 1σ-uncertainty 2023',
-    }
 
     # add the layer names in the first column (s.t. it will be shown when mouse-over)
     gdf_list = [gdf_inv, gdf_pred_0, gdf_pred_1, gdf_pred_0_unc, gdf_pred_1_unc]
@@ -250,20 +296,7 @@ if __name__ == "__main__":
     # Add layer controls
     folium.LayerControl(position='topright', collapsed=False, autoZIndex=True, draggable=True).add_to(m)
 
-    # Add an information box
-    info_html = """
-    <div id="info-box" style="position: fixed; top: 10px; left: 50px; width: auto; 
-    background-color: white; border: 2px solid black; padding: 10px; z-index: 1000;">
-        <button onclick="document.getElementById('info-box').style.display='none'" style="float: right;">x</button>
-        <b>Information:</b><br><br>
-        <ul>
-            <li>Use the layer control to switch between the different map layers
-                <br> or to show the 1σ-uncertainty as a shaded area for the DL4GAM predictions.</li>
-            <li>Click on the markers for more information on each glacier.</li>
-            <li>Note that the contours were slightly undersampled to save space.</li>
-        </ul>
-    </div>
-    """
+    # Add the information box
     m.get_root().html.add_child(folium.Element(info_html))
 
     out_fp = Path('../index.html')

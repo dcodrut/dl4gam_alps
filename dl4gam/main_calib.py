@@ -157,7 +157,7 @@ def estimate_area_bounds_with_inc_thr_all_glaciers(fp_pred_list, thresholds, num
 
 
 def calibrate_preds(fp_in, fp_out, stats_df, ensemble_size):
-    with xr.open_dataset(fp_in, mask_and_scale=False) as ds:
+    with xr.open_dataset(fp_in, mask_and_scale=False, decode_coords='all') as ds:
         scaled_probs_all = []
         for i in range(1, ensemble_size + 1):
             # calibrate the individual members
@@ -172,16 +172,27 @@ def calibrate_preds(fp_in, fp_out, stats_df, ensemble_size):
         ds['pred_b'] = (ds.pred >= 0.5)
         ds['pred_std'] = (('y', 'x'), np.std(scaled_probs_all, axis=0))
 
+        # (re)set the CRS - QGIS issues
+        for k in ds.data_vars:
+            ds[k].rio.write_crs(ds.rio.crs, inplace=True)
+
         # export the calibrated raster
         fp_out.parent.mkdir(parents=True, exist_ok=True)
         ds.to_netcdf(fp_out)
 
 
 def calibrate_bounds(fp_in, fp_out, thr):
-    with xr.open_dataset(fp_in, mask_and_scale=False) as ds:
+    with xr.open_dataset(fp_in, mask_and_scale=False, decode_coords='all') as ds:
         # recalculate the bounds using the calibrated ensemble average and stddev + the area-dependent threshold
         ds['pred_low_b'] = ((ds.pred - ds.pred_std) >= (1 - thr))
         ds['pred_high_b'] = ((ds.pred + ds.pred_std) >= thr)
+
+        # (re)set the CRS - QGIS issues
+        for k in ds.data_vars:
+            ds[k].rio.write_crs(ds.rio.crs, inplace=True)
+
+        # save the threshold in the attributes
+        ds.attrs['decision_threshold'] = thr
 
         # export
         fp_out.parent.mkdir(parents=True, exist_ok=True)

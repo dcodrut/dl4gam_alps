@@ -1,4 +1,4 @@
-import json
+import pickle
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -8,6 +8,7 @@ import pandas as pd
 import scipy.stats
 import xarray as xr
 from scipy.optimize import minimize_scalar
+from sklearn.linear_model import QuantileRegressor
 from sklearn.metrics import log_loss
 
 # local imports
@@ -99,26 +100,30 @@ def sample_points_all_glaciers(fp_list, fraction=0.05, num_procs=1):
 
 def estimate_area_bounds_with_inc_thr(fp_pred, thresholds):
     with xr.open_dataset(fp_pred, mask_and_scale=False) as ds:
-        stats_crt_g = {
-            'entry_id': fp_pred.parent.name,
-            'thr': [],
-            'area_pred': [],
-            'area_true': [],
-            'area_lb': [],
-            'area_ub': [],
-        }
-
-        # keep only the predictions within the 50m buffer and discard the other glaciers
+        # keep only the predictions within the 20m buffer and discard the other glaciers
         mask_all_g = (ds.mask_all_g_id.values != -1)
         mask_crt_g = (ds.mask_crt_g.values == 1)
         mask_other_g = (mask_all_g != mask_crt_g)
         ds['mask_other_g'] = (('y', 'x'), mask_other_g)
-        ds = ds.where((ds.mask_crt_g_b50 == 1) & ~ds.mask_other_g)
+        ds = ds.where((ds.mask_crt_g_b20 == 1) & ~ds.mask_other_g)
 
         img_avg = ds.pred.values
         f_area = 1e2 / 1e6
         area_pred = np.nansum(img_avg >= 0.5) * f_area
         img_std = ds.pred_std.values
+
+        stats_crt_g = {
+            'entry_id': fp_pred.parent.name,
+            'thr': [],
+            'area_true': np.sum(mask_crt_g) * f_area,
+            'avg_pred': np.nanmean(img_avg),
+            'unc_px_epistemic': np.sqrt(np.nanmean(img_std ** 2)),
+            'unc_px_aleatoric': np.sqrt(np.nanmean(img_avg * (1 - img_avg))),
+            'unc_px_total': np.sqrt(np.nanmean((img_std ** 2) + img_avg * (1 - img_avg))),
+            'area_pred': [],
+            'area_lb': [],
+            'area_ub': []
+        }
 
         all_areas_lb = []
         all_areas_ub = []
@@ -134,7 +139,6 @@ def estimate_area_bounds_with_inc_thr(fp_pred, thresholds):
 
             stats_crt_g['thr'].append(thr)
             stats_crt_g['area_pred'].append(area_pred)
-            stats_crt_g['area_true'].append(np.sum(mask_crt_g) * f_area)
             stats_crt_g['area_lb'].append(area_lb)
             stats_crt_g['area_ub'].append(area_ub)
 
@@ -148,10 +152,15 @@ def estimate_area_bounds_with_inc_thr_all_glaciers(fp_pred_list, thresholds, num
         fp_pred=fp_pred_list,
         thresholds=thresholds,
         num_procs=num_procs,
-        pbar_desc='Estimating glacier area bounds with increasing thresholds'
+        pbar_desc='Estimating glacier area bounds with multiple thresholds'
     )
     df = pd.concat(df_all)
-    df = df.sort_values('entry_id')
+    df = df.sort_values(['entry_id', 'thr'])
+    df['area_pred_error'] = df.area_pred - df.area_true
+    df['area_pred_error_abs'] = df['area_pred_error'].abs()
+    df['area_pred_error_est'] = (df.area_ub - df.area_lb) / 2
+    df['est_err_vs_actual_err'] = (df.area_pred_error_est - df.area_pred_error_abs).abs()
+    df['pred_is_within_bounds'] = ((df.area_lb <= df.area_true) & (df.area_true <= df.area_ub))
 
     return df
 
@@ -192,7 +201,7 @@ def calibrate_bounds(fp_in, fp_out, thr):
             ds[k].rio.write_crs(ds.rio.crs, inplace=True)
 
         # save the threshold in the attributes
-        ds.attrs['decision_threshold'] = thr
+        ds.attrs['tau'] = thr
 
         # export
         fp_out.parent.mkdir(parents=True, exist_ok=True)
@@ -412,101 +421,145 @@ if __name__ == "__main__":
     # the resulting lower and upper bounds of the glacier areas are also calibrated
     # (i.e. capture the errors w.r.t the ground truth)
 
-    # if calculated, we always use the validation set of the inventory year for the calibrated threshold
-    if not is_inventory_year or fold != 's_valid':
-        fp = stats_dir_root.parent / 'inv' / 's_valid' / 'calibration_stats_areas_thr.json'
+    if is_inventory_year and fold == 's_test':
+        # if we are on the test set of the inventory year, we need the regression model from the validation set
+        # (we assume that the validation set is representative enough for the test set)
+        fp = stats_dir_root.parent / 'inv' / 's_valid' / 'calibration_areas_thr_model.pickle'
+        print(f"Loading calibration model (area-level) from {fp}")
+        with open(fp, 'rb') as f:
+            model_active = pickle.load(f)
+
+    if not is_inventory_year:
+        # for 2023, we use the thresholds from the inventory year from the corresponding fold
+        # (which are based on the model fitted on the validation set of the inventory year)
+        fp = stats_dir_root.parent / 'inv' / fold / 'calibration_stats_active.csv'
         print(f"Loading calibration stats (area-level) from {fp}")
-        with open(fp, 'r') as f:
-            stats_d_inv_val = json.load(f)
-            print(json.dumps(stats_d_inv_val, indent=4))
-            thr_actual = stats_d_inv_val['thr_best']
+        df_active = pd.read_csv(fp)
+        active_thrs = df_active.thr.values
 
-    if is_inventory_year:
-        # we run this step only if we are in the inventory year
-        # (the test set is used only for showing the calibration diagrams)
+    # read the previously calibrated rasters (pixel-wise)
+    fp_list = sorted(list(preds_dir_calib_px.rglob('*.nc')))
 
-        # read the previously calibrated rasters
-        fp_list = sorted(list(preds_dir_calib_px.rglob('*.nc')))
+    thr_step = 1e-3
+    stats_df = estimate_area_bounds_with_inc_thr_all_glaciers(
+        fp_pred_list=fp_list,
+        thresholds=np.arange(0.0, 0.5 + thr_step, thr_step),
+        num_procs=C.NUM_PROCS
+    )
 
-        thr_step = 1e-3
-        stats_df = estimate_area_bounds_with_inc_thr_all_glaciers(
-            fp_pred_list=fp_list,
-            thresholds=np.arange(0.0, 0.5 + thr_step, thr_step),
-            num_procs=C.NUM_PROCS
-        )
+    # export the stats
+    fp = stats_dir / 'calibration_stats_areas_all.csv'
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    stats_df.to_csv(fp, index=False)
+    print(f"Calibration stats for area bounds calibration saved to {fp}")
 
-        stats_df['area_pred_error'] = stats_df.area_pred - stats_df.area_true
-        stats_df['area_pred_error_abs'] = stats_df['area_pred_error'].abs()
-        stats_df['area_pred_error_est'] = (stats_df.area_ub - stats_df.area_lb) / 2
-        stats_df['est_err_vs_actual_err'] = (stats_df.area_pred_error_est - stats_df.area_pred_error_abs).abs()
-        stats_df['pred_is_within_bounds'] = (
-                (stats_df.area_lb <= stats_df.area_true) &
-                (stats_df.area_true <= stats_df.area_ub)
-        )
+    # compute, for each glacier, the largest threshold which leads to an interval that encompasses the true area
+    stats_df_best = stats_df.groupby('entry_id', sort=True).apply(
+        lambda _: _.iloc[np.where(_.pred_is_within_bounds)[0][-1]], include_groups=False
+    )
+    p_target = scipy.stats.norm.cdf(1) - scipy.stats.norm.cdf(-1)  # probability mass within ±1 sigma, ~68.2%
 
-        # export the stats
-        fp = stats_dir / 'calibration_stats_areas_all.csv'
-        stats_df.to_csv(fp, index=False)
-        print(f"Calibration stats for area bounds calibration saved to {fp}")
+    # save the (1 - p_target) quantile from the best thresholds
+    # (this sub-regionally calibrated threshold would give us the desired coverage)
+    q = 1 - p_target
+    thr_best_regional = stats_df_best.thr.quantile(q)
 
-        # compute the best threshold
-        p_target = scipy.stats.norm.cdf(1) - scipy.stats.norm.cdf(-1)  # probability mass within ±1 sigma, ~68.2%
-        tdf = stats_df.groupby(['thr']).mean(numeric_only=True).reset_index()
-        r_best = tdf.iloc[np.argmin(np.abs(tdf.pred_is_within_bounds.values - p_target))]
-        thr_best = r_best['thr']
+    # the previous threshold still doesn't generalize well to the test set, so instead we try to learn it
+    # (using a Quantile regression model with a couple of engineered features as inputs)
+    stats_df_best['area_pred_log'] = np.log(stats_df_best.area_pred.clip(lower=1e-2))
+    x = stats_df_best[['area_pred_log', 'avg_pred', 'unc_px_epistemic', 'unc_px_aleatoric']].values
 
-        # if we are using the validation set, we use the threshold we just computed
-        if fold == 's_valid':
-            thr_actual = thr_best
-            r_actual = r_best
-        else:
-            # we're on testing; find the actual threshold using the validation set
-            r_actual = tdf[tdf.thr == thr_actual].iloc[0]
-            thr_actual = r_actual['thr']
+    # we transform the threshold to a logit scale, followed by some clipping to avoid numerical issues
+    y = (stats_df_best.thr / 0.5).clip(lower=1e-4, upper=1 - 1e-4).values
+    z = np.log(y / (1 - y))  # logit of tau
 
-        print(f"fold = {fold}; thr_best = {thr_best:.3f}; thr_actual = {thr_actual:.3f}")
+    # fit the quantile regression model; if we are on the test set, we will validation set model
+    # but we are still fitting it to the test set too for getting the stats
+    model_best = QuantileRegressor(fit_intercept=True, alpha=0, quantile=q).fit(x, z)
+    thrs_pred_best = 0.5 * (1 / (1 + np.exp(-model_best.predict(x))))
+    stats_df_best['thr_pred_best'] = thrs_pred_best
 
-        # export to a json file
-        fp = stats_dir / 'calibration_stats_areas_thr.json'
-        with open(fp, 'w') as f:  # TODO: save also the other stats for test
-            stats_area_dict = {
-                'thr_best': thr_best,
-                'thr_actual': thr_actual,
-                'p_target': p_target,
-                'p_actual': r_actual.pred_is_within_bounds,
-                'p_best': r_best.pred_is_within_bounds,
-                'stats_actual': r_actual.to_dict(),
-                'stats_best': r_best.to_dict()
-            }
-            json.dump(stats_area_dict, f, indent=4)
-            print(f"Calibration threshold for area bounds saved to {fp}")
-            print(json.dumps(stats_area_dict, indent=4))
+    # if we are on the validation set of the inventory year, save the model and use the predicted thresholds
+    if is_inventory_year and fold == 's_valid':
+        # we use & save the model fitted on the validation set of the inventory year
+        thrs_pred_active = stats_df_best.thr_pred_best
 
-        plt.figure(dpi=150, figsize=(15, 5))
-        plt.scatter(tdf['thr'], tdf['pred_is_within_bounds'], color='C0')
-        plt.axhline(y=p_target, color='C1', linestyle='--', label='p_target')
-        plt.axvline(x=thr_best, color='C2', linestyle='--', label='thr_best')
-        plt.axvline(x=thr_actual, color='C3', linestyle='--', label='thr_actual')
-        plt.xlabel('thr')
-        plt.ylabel('pred_is_within_bounds (avg)')
-        plt.title('Calibration threshold for glacier areas')
-        plt.legend()
-        plt.grid()
-        fp = stats_dir / f"calibration_thr_areas.png"
-        plt.savefig(fp, bbox_inches='tight')
+        fp = stats_dir / 'calibration_areas_thr_model.pickle'
+        with open(fp, 'wb') as f:
+            pickle.dump(model_best, f)
+        print(f"Calibration model for area bounds saved to {fp}")
+    elif is_inventory_year and fold == 's_test':
+        # we're on testing of inventory year, use the model fitted on the validation set of the inventory year
+        print(f"Using the calibration model from the validation set of the inventory year")
+        thrs_pred_active = 0.5 * (1 / (1 + np.exp(-model_active.predict(x))))
+    else:
+        # for 2023, we use the thresholds from the inventory year from the corresponding fold
+        print(f"Using the active thresholds from the inventory year")
+        thrs_pred_active = active_thrs
+
+    stats_df_best['thr_pred_active'] = thrs_pred_active
+
+    # export the stats with the best thresholds and the modelled ones
+    fp = stats_dir / 'calibration_stats_best.csv'
+    stats_df_best.to_csv(fp)
+    print(f"Calibration stats for area bounds (best thr + modelled) saved to {fp}")
+
+    # compute the coverage with the predicted thresholds
+    stats_df_active = estimate_area_bounds_with_inc_thr_all_glaciers(
+        fp_pred_list=fp_list,
+        thresholds=[[_] for _ in thrs_pred_active],  # we need to pass a list of lists to match in run_in_parallel
+        num_procs=C.NUM_PROCS
+    )
+    fp = stats_dir / 'calibration_stats_active.csv'
+    stats_df_active.to_csv(fp, index=False)
+    print(f"Calibration stats for area bounds (active thr) saved to {fp}")
+
+    print(
+        f"fold = {fold}; "
+        f"full cov thr: avg = {stats_df_best.thr.mean():.3f}; Q-{q:.1%} = {thr_best_regional:.3f}; "
+        f"pred thr best avg = {stats_df_best.thr_pred_best.mean():.3f}; "
+        f"pred thr active avg = {stats_df_best.thr_pred_active.mean():.3f}; "
+        f"coverage = {stats_df_active.pred_is_within_bounds.mean():.1%}"
+    )
+
+    # plot the predicted & crt thresholds against the full coverage thresholds
+    plt.figure(dpi=200, figsize=(8, 8))
+    plt.scatter(
+        stats_df_best.thr_pred_best, stats_df_best.thr, color='C0',
+        label=f"Predicted best (avg = {stats_df_best.thr_pred_best.mean():.3f}; "
+              f"med = {stats_df_best.thr_pred_best.median():.3f})"
+    )
+    plt.scatter(
+        stats_df_active.thr, stats_df_best.thr, color='C1',
+        label=f"Predicted active (avg = {stats_df_active.thr.mean():.3f}; "
+              f"med = {stats_df_active.thr.median():.3f}); "
+              f"cov = {stats_df_active.pred_is_within_bounds.mean():.1%}"
+    )
+    plt.axhline(
+        y=thr_best_regional, color='C2', linestyle='--',
+        label=f'Q-{q:.1%} = {thr_best_regional:.3f}; '
+              f'avg = {stats_df_best.thr.mean():.3f};'
+              f' med = {stats_df_best.thr.median():.3f}'
+    )
+    plt.xlim(0, 0.5)
+    plt.ylim(0, 0.5)
+    plt.xlabel('Predicted thr')
+    plt.ylabel('Full coverage thr')
+    plt.title('Predicted thrs (best & active) against full coverage thrs')
+    plt.grid()
+    plt.legend()
+    plt.savefig(stats_dir / 'predicted_vs_full_cov_thr.png', bbox_inches='tight')
 
     ####################################################################################################################
     # 4th part: calibrate the lower and upper bounds for the glacier areas and export the rasters
-
-    # prepare the paths to the (pixel-level) calibrated rasters
-    fp_list = sorted(list(preds_dir_calib_px.rglob('*.nc')))
     preds_dir_calib = Path(*p[:p.index('preds')]) / 'preds_calib' / Path(*p[p.index('preds') + 1:]) / fold
 
+    # we use the active thresholds for the calibration
     run_in_parallel(
         fun=calibrate_bounds,
         fp_in=fp_list,
         fp_out=[preds_dir_calib / fp.relative_to(preds_dir_calib_px) for fp in fp_list],
-        thr=thr_actual,
+        thr=thrs_pred_active.tolist(),
         num_procs=C.NUM_PROCS,
         pbar_desc='Calibrating the rasters (area bounds)'
     )

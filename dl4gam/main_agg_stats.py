@@ -10,7 +10,6 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from sklearn.metrics import r2_score
 
 # local imports
 from config import C
@@ -350,10 +349,11 @@ def compute_change_rates(df_t0: pd.DataFrame, df_t1: pd.DataFrame):
     df_rates['area_rate'] = (df_rates.area_t1 - df_rates.area_t0) / df_rates.num_years
 
     # compute the rate of change per year in percentage
-    df_rates['area_rate_prc'] = df_rates.area_rate / df_rates.area_t0
+    df_rates['area_rate_prc'] = df_rates.area_rate / df_rates.area_t0 * 100
 
     # compute the standard deviation of the glacier-wide change rate (assuming the errors are independent)
     df_rates['area_rate_std'] = (df_rates.area_t0_std ** 2 + df_rates.area_t1_std ** 2) ** 0.5 / df_rates.num_years
+    df_rates['area_rate_prc_std'] = df_rates.area_rate_std / df_rates.area_t0 * 100
 
     print("\nGlacier-wide area change rates statistics (before filtering & interpolation):")
     print_regional_area_change_stats(df_rates)
@@ -481,6 +481,13 @@ def extrapolate_area_change_rates(
             idx_extrapolate = (df_rates_all_g.area_inv < min_area)
             df_rates_all_g.loc[idx_extrapolate, 'area_class'] = area_class
 
+    # save the original stats before the interpolation
+    for c in [
+        'area_t0', 'area_t0_std', 'area_t1', 'area_t1_std',
+        'area_rate', 'area_rate_std', 'area_rate_prc', 'area_rate_prc_std'
+    ]:
+        df_rates_all_g[f'{c}_orig'] = df_rates_all_g[c]
+
     print(f"model_type = {model_type}")
     df_rates_all_g['area_rate_pred'] = np.nan
     df_rates_all_g['area_rate_pred_std'] = np.nan
@@ -538,17 +545,22 @@ def extrapolate_area_change_rates(
         df_rates_all_g['area_rate_prc_pred'] = df_rates_all_g.area_rate_pred / df_rates_all_g.area_inv
 
     if model_type == '2d-polynomial':
-        df = df_rates_all_g[df_rates_all_g.filtered == False]
+        # use all the available estimates but weight them by the estimated uncertainty
+        idx_ok_all = (~df_rates_all_g.area_rate_prc.isna()) & np.isfinite(df_rates_all_g.area_rate_prc)
+        df = df_rates_all_g[idx_ok_all]
 
+        # fit a 2D polynomial to the logarithm of the inventory area, its square, and the relative change rate
         log_area = np.log10(df.area_inv)
-        rel_change = df.area_rate_prc * 100
         X = pd.DataFrame({
             "log_area": log_area,
             "log_area_sq": log_area ** 2
         })
         X = sm.add_constant(X)
-        model = sm.OLS(rel_change, X).fit()
-        # print(model.summary())
+        y = df.area_rate_prc.values
+        y_err = df.area_rate_prc_std.values
+        model = sm.WLS(y, X, weights=1 / (y_err ** 2)).fit()
+        # model = sm.OLS(y, X).fit()
+        print(model.summary())
 
         a = model.params["const"]
         b = model.params["log_area"]
@@ -561,21 +573,15 @@ def extrapolate_area_change_rates(
 
         log_area_range = np.log10(df_rates_all_g.area_inv.values)
         X_pred = pd.DataFrame({
-            "const": 1,
             "log_area": log_area_range,
             "log_area_sq": log_area_range ** 2
         })
-        rel_change_pred = model.predict(X_pred).values
-        df_rates_all_g['area_rate_prc_pred'] = rel_change_pred / 100
-        df_rates_all_g['area_rate_pred'] = rel_change_pred / 100 * df_rates_all_g.area_inv
+        X_pred = sm.add_constant(X_pred)
+        y_pred = model.predict(X_pred).values
+        df_rates_all_g['area_rate_prc_pred'] = y_pred
+        df_rates_all_g['area_rate_pred'] = y_pred / 100 * df_rates_all_g.area_inv
 
-    # save the original area change rates and then replace them with the interpolated ones
-    df_rates_all_g['area_t0_orig'] = df_rates_all_g.area_t0
-    df_rates_all_g['area_t0_std_orig'] = df_rates_all_g.area_t0_std
-    df_rates_all_g['area_t1_orig'] = df_rates_all_g.area_t1
-    df_rates_all_g['area_t1_std_orig'] = df_rates_all_g.area_t1_std
-    df_rates_all_g['area_rate_orig'] = df_rates_all_g.area_rate
-    df_rates_all_g['area_rate_std_orig'] = df_rates_all_g.area_rate_std
+    # replace the filtered points with the interpolated ones
     idx_to_fill_in = ~(df_rates_all_g.filtered == False)
     df_rates_all_g.loc[idx_to_fill_in, 'area_rate'] = df_rates_all_g[idx_to_fill_in].area_rate_pred
     df_rates_all_g.loc[idx_to_fill_in, 'area_rate_std'] = df_rates_all_g[idx_to_fill_in].area_rate_pred_std
@@ -584,19 +590,15 @@ def extrapolate_area_change_rates(
     df_rates_all_g.loc[idx_to_fill_in, 'area_t1'] = df_rates_all_g[idx_to_fill_in].area_t0 + df_rates_all_g[
         idx_to_fill_in].area_rate * df_rates_all_g[idx_to_fill_in].num_years
     df_rates_all_g.loc[idx_to_fill_in, 'area_t1_std'] = df_rates_all_g[idx_to_fill_in].area_t1_pred_std
+    # recompute the relative change rates
+    df_rates_all_g['area_rate_prc'] = df_rates_all_g.area_rate / df_rates_all_g.area_t0 * 100
+    df_rates_all_g['area_rate_prc_std'] = df_rates_all_g.area_rate_std / df_rates_all_g.area_t0 * 100
 
     # sort back
     df_rates_all_g = df_rates_all_g.sort_values('entry_id')
 
     df_rates_all_g.area_class = pd.Categorical(df_rates_all_g.area_class, categories=area_classes)
     print(df_rates_all_g.groupby('area_class', observed=False).area_rate_prc.describe().reset_index())
-
-    # compute the R2 over all the predictions
-    idx_training = (~df_rates_all_g.area_rate_pred.isna()) & (df_rates_all_g.filtered == False)
-    y = df_rates_all_g.area_rate[idx_training].values
-    y_pred = df_rates_all_g.area_rate_pred[idx_training].values
-    r2 = r2_score(y, y_pred)
-    print(f"R² = {r2 * 100:.1f}%")
 
     print_regional_area_change_stats(df_rates_all_g)
 

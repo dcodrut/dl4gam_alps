@@ -256,6 +256,8 @@ if __name__ == "__main__":
 
     preds_dir = inference_dir_root / fold
     stats_dir = stats_dir_root / fold
+    print(f'preds_dir = {preds_dir}')
+    print(f'stats_dir = {stats_dir}')
 
     # get all the glacier-wide predictions
     fp_list = sorted(list(preds_dir.rglob('*.nc')))
@@ -267,6 +269,7 @@ if __name__ == "__main__":
     # if calculated, we always use the validation set of the inventory year for the calibrated temperature(s)
     if not is_inventory_year or fold != 's_valid':
         fp = stats_dir_root.parent / 'inv' / 's_valid' / 'calibration_stats_px.csv'
+        fp = str(fp).replace('s2_sgi', 's2_alps_plus')  # TODO: parametrize this
         print(f"Loading calibration stats (pixel-level) from {fp}")
         stats_df_inv_val = pd.read_csv(fp)
         print(stats_df_inv_val)
@@ -425,6 +428,7 @@ if __name__ == "__main__":
         # if we are on the test set of the inventory year, we need the regression model from the validation set
         # (we assume that the validation set is representative enough for the test set)
         fp = stats_dir_root.parent / 'inv' / 's_valid' / 'calibration_areas_thr_model.pickle'
+        fp = str(fp).replace('s2_sgi', 's2_alps_plus')  # TODO: parametrize this
         print(f"Loading calibration model (area-level) from {fp}")
         with open(fp, 'rb') as f:
             model_active = pickle.load(f)
@@ -439,6 +443,7 @@ if __name__ == "__main__":
 
     # read the previously calibrated rasters (pixel-wise)
     fp_list = sorted(list(preds_dir_calib_px.rglob('*.nc')))
+    print(f'Found {len(fp_list)} calibrated predictions in {preds_dir_calib_px}')
 
     thr_step = 1e-3
     stats_df = estimate_area_bounds_with_inc_thr_all_glaciers(

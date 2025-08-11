@@ -34,19 +34,17 @@ else
 fi
 echo "SEEDS = ${SEEDS[@]}"
 
+FOLDS=("s_test")
 if [[ $DATASET_NAME == "s2_alps_plus" ]]; then
   SPLITS=("1" "2" "3" "4" "5")
+  if [[ $EVAL_SUBDIR == "inv" ]]; then
+    # wee need to evaluate the models on the validation set first so we can calibrate them
+    FOLDS=("s_valid" "s_test")
+  fi
 elif [ "$DATASET_NAME" == "s2_sgi" ]; then
   SPLITS=("2" "3" "4" "5")
 fi
 echo "SPLITS = ${SPLITS[@]}"
-
-if [[ $EVAL_SUBDIR == "inv" ]]; then
-  # wee need to evaluate the models on the validation set first so we can calibrate them
-  FOLDS=("s_valid" "s_test")
-else
-  FOLDS=("s_test")
-fi
 echo "FOLDS = ${FOLDS[@]}"
 
 for SPLIT in "${SPLITS[@]}"; do

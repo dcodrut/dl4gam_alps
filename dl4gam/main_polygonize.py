@@ -76,6 +76,11 @@ if __name__ == "__main__":
 
     # polygonize the predictions
     geom_all = {k: [] for k in ['entry_id', 'geometry', 'nc_crs', 'image_id', 'image_date', 'label', 'split']}
+
+    # save also the tau thresholds if available
+    if args.use_calib:
+        geom_all['tau'] = []
+
     for i in tqdm(range(len(df_all)), desc=f"Polygonizing predictions"):
         fp = df_all.fp.iloc[i]
         nc = xr.open_dataset(fp, decode_coords='all')
@@ -123,6 +128,7 @@ if __name__ == "__main__":
             geom_all['image_date'].append(pd.to_datetime(fp.stem[:8], format='%Y%m%d').strftime('%Y-%m-%d'))
             geom_all['label'].append(k)
             geom_all['split'].append(f"split_{df_all.split.iloc[i]}")
+            geom_all['tau'].append(nc.attrs.get('tau', None))
 
     # export the geodataframe(s), separated by the label
     gdf = gpd.GeoDataFrame(geom_all)

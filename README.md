@@ -9,7 +9,7 @@ This glacier-centric approach also makes the framework easier to adapt to other 
 Currently, the models ([U-Net](https://arxiv.org/abs/1505.04597) ensemble) are trained and validated on the European Alps, using a 5-fold cross-validation setup, so we can use only the testing folds when later computing the area changes. 
 
 Useful links:
-- preprint: https://doi.org/10.22541/essoar.173557607.70204641/v1
+- preprint: https://doi.org/10.22541/essoar.173557607.70204641/v3
 - predicted glacier outlines: https://dcodrut.github.io/dl4gam_alps/
   - or here: https://huggingface.co/datasets/dcodrut/dl4gam_alps/viewer for sweeping over images + predictions using ↑↓
 - dataset description: https://huggingface.co/datasets/dcodrut/dl4gam_alps

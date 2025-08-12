@@ -6,6 +6,7 @@ import geopandas as gpd
 import leafmap.foliumap as leafmap
 import matplotlib.pyplot as plt
 import pandas as pd
+import shapely.geometry
 from folium.plugins import MarkerCluster
 
 
@@ -124,6 +125,10 @@ if __name__ == "__main__":
     gdf_pred_ub_0 = gpd.read_file(all_paths['preds_0_high'])
     gdf_pred_lb_1 = gpd.read_file(all_paths['preds_1_low'])
     gdf_pred_ub_1 = gpd.read_file(all_paths['preds_1_high'])
+
+    # make sure we don't have missing geometries in the bounds (fill them with empty polygons)
+    for df in [gdf_pred_lb_0, gdf_pred_ub_0, gdf_pred_lb_1, gdf_pred_ub_1]:
+        df['geometry'] = df['geometry'].fillna(shapely.geometry.Polygon())
 
     # add the area in km2 and then convert to WGS84
     for df in [gdf_inv, gdf_pred_0, gdf_pred_1, gdf_pred_lb_0, gdf_pred_ub_0, gdf_pred_lb_1, gdf_pred_ub_1]:
@@ -281,7 +286,7 @@ if __name__ == "__main__":
                 f'(<a href="https://huggingface.co/datasets/dcodrut/dl4gam_alps/resolve/main/preds/'
                 f'{entry_id}_{image_date_t1}.png">Visualize image with predictions</a>)',
             f'Annual area change rate:': f"{r.area_rate:.4f} ± {r.area_rate_std:.4f} km² y⁻¹",
-            ';'.join(['&nbsp'] * 42): f"({r.area_rate_prc * 100:.2f} ± {r.area_rate_std / r.area_t0 * 100:.2f} % y⁻¹)",
+            ';'.join(['&nbsp'] * 42): f"({r.area_rate_prc:.2f} ± {r.area_rate_std / r.area_t0 * 100:.2f} % y⁻¹)",
             f'Passed QC filter:': qc_filter_info
         }
         folium.Marker(
